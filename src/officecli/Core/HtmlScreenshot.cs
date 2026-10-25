@@ -1,3 +1,4 @@
+// Modified in the ClinVision fork (drpedapati/OfficeCLI, branch clinvision): see FORK.md.
 // Copyright 2026 OfficeCLI (https://OfficeCLI.AI)
 // SPDX-License-Identifier: Apache-2.0
 
@@ -358,6 +359,8 @@ internal static class HtmlScreenshot
 
     private static IEnumerable<(string, Func<string, string, int, int, (bool, string?)>)> Backends()
     {
+        // ClinVision fork: never start a browser; previews name CDN scripts (three.js, KaTeX).
+        yield break;
         yield return ("playwright", TryPlaywright);
         yield return ("chrome", TryChrome);
         yield return ("firefox", TryFirefox);
@@ -413,6 +416,8 @@ internal static class HtmlScreenshot
 
     private static string? FindChrome()
     {
+        // ClinVision fork: no browser for screenshots, DOM page counts or TOC refresh (see Backends).
+        return null;
         string[] names = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
                           "chrome", "microsoft-edge", "microsoft-edge-stable", "msedge"];
         var pathHit = WhichFirst(names);
