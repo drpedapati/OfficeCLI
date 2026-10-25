@@ -1,3 +1,4 @@
+// Modified in the ClinVision fork (drpedapati/OfficeCLI, branch clinvision): see FORK.md.
 // Copyright 2026 OfficeCLI (https://OfficeCLI.AI)
 // SPDX-License-Identifier: Apache-2.0
 
@@ -35,6 +36,7 @@ public static class PluginRegistry
     /// <param name="ext">File extension with leading dot, lowercase (e.g. ".doc").</param>
     public static ResolvedPlugin? FindFor(PluginKind kind, string ext)
     {
+        return null;
         ext = NormalizeExt(ext);
         var key = (kind, ext);
 
@@ -66,6 +68,7 @@ public static class PluginRegistry
     /// </summary>
     public static IReadOnlyList<ResolvedPlugin> EnumerateAll()
     {
+        return [];
         var seen = new Dictionary<string, ResolvedPlugin>(StringComparer.OrdinalIgnoreCase);
         foreach (var dir in CandidateDirectories())
         {

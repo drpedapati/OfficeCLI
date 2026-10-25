@@ -1,3 +1,4 @@
+// Modified in the ClinVision fork (drpedapati/OfficeCLI, branch clinvision): see FORK.md.
 // Copyright 2026 OfficeCLI (https://OfficeCLI.AI)
 // SPDX-License-Identifier: Apache-2.0
 
@@ -181,7 +182,7 @@ public static class MermaidImageRenderer
     private static string CachedJsPath => Path.Combine(CacheDir, $"mermaid-{MermaidVersion}.min.js");
 
     /// <summary>True when any image backend is available: mmdc, or a chrome-family browser.</summary>
-    public static bool IsAvailable() => TryLocateMmdc(out _) || HtmlScreenshot.HasChromeFamily();
+    public static bool IsAvailable() => false;
 
     /// <summary>
     /// Daily-refresh hook, called from <see cref="UpdateChecker"/>'s once-per-24h
@@ -193,6 +194,7 @@ public static class MermaidImageRenderer
     /// </summary>
     public static void RefreshCacheIfPresent()
     {
+        return;
         try
         {
             if (!File.Exists(CachedJsPath)) return; // refresh only what the user actually uses
@@ -218,6 +220,7 @@ public static class MermaidImageRenderer
     /// </summary>
     public static string RenderToPngFile(string mermaid, string? background = null)
     {
+        throw new InvalidOperationException("Mermaid rendering is disabled in this build (it loads scripts from the network).");
         Exception? failure = null;
         if (TryLocateMmdc(out var mmdc))
         {

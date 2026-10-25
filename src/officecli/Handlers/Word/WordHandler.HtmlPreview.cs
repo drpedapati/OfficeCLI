@@ -1,3 +1,4 @@
+// Modified in the ClinVision fork (drpedapati/OfficeCLI, branch clinvision): see FORK.md.
 // Copyright 2026 OfficeCLI (https://OfficeCLI.AI)
 // SPDX-License-Identifier: Apache-2.0
 
@@ -252,7 +253,8 @@ public partial class WordHandler
                 .Where(f => !string.IsNullOrEmpty(f))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
-            if (webFontCandidates.Count > 0)
+            // ClinVision fork: never load web fonts; the local metric-override block keeps layout stable.
+            if (false)
             {
                 // Sanitized names contain only letters/digits/space/.-_ so plain
                 // quote-wrapping is JSON-safe (no escapable characters survive).

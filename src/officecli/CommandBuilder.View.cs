@@ -1,3 +1,4 @@
+// Modified in the ClinVision fork (drpedapati/OfficeCLI, branch clinvision): see FORK.md.
 // Copyright 2026 OfficeCLI (https://OfficeCLI.AI)
 // SPDX-License-Identifier: Apache-2.0
 
@@ -163,6 +164,7 @@ static partial class CommandBuilder
 
                 if (html != null)
                 {
+                    html = OfflineHtml(html);
                     if (outArg != null || browser)
                     {
                         // --out: write to the requested path. --browser without --out:
@@ -801,5 +803,18 @@ static partial class CommandBuilder
         if (p > slideCount)
             throw new ArgumentException($"--page {p} out of range (total slides: {slideCount}).");
         return (p, p);
+    }
+
+    /// <summary>
+    /// ClinVision fork: a preview may name CDN scripts and web fonts; this policy makes a browser
+    /// load nothing from the network, so only inline content and data URIs render.
+    /// </summary>
+    internal static string OfflineHtml(string html)
+    {
+        const string policy = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; "
+            + "img-src data: blob:; media-src data: blob:; font-src data:; style-src 'unsafe-inline'; "
+            + "script-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'\">";
+        var head = html.IndexOf("<head>", StringComparison.OrdinalIgnoreCase);
+        return head < 0 ? policy + html : html.Insert(head + "<head>".Length, policy);
     }
 }

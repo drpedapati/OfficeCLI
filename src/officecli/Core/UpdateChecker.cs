@@ -1,3 +1,4 @@
+// Modified in the ClinVision fork (drpedapati/OfficeCLI, branch clinvision): see FORK.md.
 // Copyright 2026 OfficeCLI (https://OfficeCLI.AI)
 // SPDX-License-Identifier: Apache-2.0
 
@@ -22,6 +23,9 @@ namespace OfficeCli.Core;
 /// </summary>
 internal static class UpdateChecker
 {
+    /// <summary>ClinVision fork: this build never checks for, downloads, or applies updates.</summary>
+    internal const bool OfflineBuild = true;
+
     // Resolved per-call rather than cached so tests can override $HOME between
     // cases without restarting the process. Production behavior is unchanged —
     // $HOME never moves under a running officecli invocation.
@@ -45,6 +49,7 @@ internal static class UpdateChecker
     /// </summary>
     internal static void CheckInBackground()
     {
+        if (OfflineBuild) return;
         if (Environment.GetEnvironmentVariable("OFFICECLI_SKIP_UPDATE") == "1")
             return;
 
@@ -105,6 +110,7 @@ internal static class UpdateChecker
     /// </summary>
     internal static void RunRefresh()
     {
+        if (OfflineBuild) return;
         if (Environment.GetEnvironmentVariable("OFFICECLI_SKIP_UPDATE") == "1")
             return;
 
@@ -310,6 +316,7 @@ internal static class UpdateChecker
     /// </summary>
     internal static bool TryApplyPendingUpdate(string exePath)
     {
+        if (OfflineBuild) return false;
         try
         {
             var updatePath = exePath + ".update";

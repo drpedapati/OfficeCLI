@@ -1,3 +1,4 @@
+// Modified in the ClinVision fork (drpedapati/OfficeCLI, branch clinvision): see FORK.md.
 // Copyright 2026 OfficeCLI (https://OfficeCLI.AI)
 // SPDX-License-Identifier: Apache-2.0
 
@@ -36,6 +37,8 @@ internal static class ImageSource
         // HTTP(S) URL
         if (source.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
             source.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Image URLs are disabled in this build; supply a file or data URI.");
+        if (false)
             return ResolveUrl(source);
 
         // Local file path

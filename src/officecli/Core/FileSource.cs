@@ -1,3 +1,4 @@
+// Modified in the ClinVision fork (drpedapati/OfficeCLI, branch clinvision): see FORK.md.
 // Copyright 2026 OfficeCLI (https://OfficeCLI.AI)
 // SPDX-License-Identifier: Apache-2.0
 
@@ -30,6 +31,8 @@ internal static class FileSource
 
         if (source.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
             source.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("URLs are disabled in this build; supply a file.");
+        if (false)
             return ResolveUrl(source);
 
         return ResolveFile(source);
@@ -43,8 +46,8 @@ internal static class FileSource
     {
         if (string.IsNullOrWhiteSpace(source)) return false;
         if (source.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) return true;
-        if (source.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) return true;
-        if (source.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return true;
+        if (source.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) return false;
+        if (source.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return false;
         return File.Exists(source);
     }
 
