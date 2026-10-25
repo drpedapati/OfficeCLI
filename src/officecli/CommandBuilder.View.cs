@@ -814,7 +814,8 @@ static partial class CommandBuilder
         const string policy = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; "
             + "img-src data: blob:; media-src data: blob:; font-src data:; style-src 'unsafe-inline'; "
             + "script-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'\">";
-        var head = html.IndexOf("<head>", StringComparison.OrdinalIgnoreCase);
-        return head < 0 ? policy + html : html.Insert(head + "<head>".Length, policy);
+        var head = System.Text.RegularExpressions.Regex.Match(html, @"<head\b[^>]*>",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return head.Success ? html.Insert(head.Index + head.Length, policy) : policy + html;
     }
 }

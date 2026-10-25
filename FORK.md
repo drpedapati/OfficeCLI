@@ -15,11 +15,12 @@ other programs on its own. Each change below is marked in its file with a `ClinV
 | Mermaid rendering is off: it loads its script from `d.officecli.ai` or jsDelivr and starts a browser. | `src/officecli/Core/Diagram/MermaidImageRenderer.cs` |
 | Plugin discovery finds nothing, so no external `officecli-*` program is started. | `src/officecli/Core/Plugins/PluginRegistry.cs` |
 | The Word preview never adds the web-font loader (it sent document font names to `d.officecli.ai` / Google Fonts). | `src/officecli/Handlers/Word/WordHandler.HtmlPreview.cs` |
-| `view html` output carries a Content-Security-Policy that blocks every network load; only inline content and data URIs render. | `src/officecli/CommandBuilder.View.cs` |
+| `view html` output carries a Content-Security-Policy that blocks every network load; only inline content and data URIs render. This holds whether the command runs directly or through the resident process that `create` starts by default. | `src/officecli/CommandBuilder.View.cs`, `src/officecli/ResidentServer.cs` |
 
 Not changed, and not used by ClinVision: `watch` (local HTTP preview server), `mcp` and its
-installers, `view screenshot` (starts a browser), and resident mode (set
-`OFFICECLI_NO_AUTO_RESIDENT=1`).
+installers, and `view screenshot` (starts a browser). Resident mode (a background copy of
+`officecli` holding the file open, reached over a local named pipe) stays on by default; set
+`OFFICECLI_NO_AUTO_RESIDENT=1` to run each command on its own.
 
 To move to a newer upstream release: merge the upstream tag into `clinvision`, keep every change in
 the table, rebuild, and re-run ClinVision's OfficeCLI checks before re-vendoring.

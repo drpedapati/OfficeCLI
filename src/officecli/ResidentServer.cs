@@ -1,3 +1,4 @@
+// Modified in the ClinVision fork (drpedapati/OfficeCLI, branch clinvision): see FORK.md.
 // Copyright 2026 OfficeCLI (https://OfficeCLI.AI)
 // SPDX-License-Identifier: Apache-2.0
 
@@ -1553,6 +1554,8 @@ public class ResidentServer : IDisposable
 
             if (html != null)
             {
+                // ClinVision fork: `create` starts a resident by default, so this path needs the CSP too.
+                html = CommandBuilder.OfflineHtml(html);
                 // CONSISTENCY(view-html-stdout): mirror CommandBuilder.View.cs — default
                 // mode writes HTML to stdout so `officecli view file html > out.html`
                 // captures actual content. --out writes to the requested path; --browser
