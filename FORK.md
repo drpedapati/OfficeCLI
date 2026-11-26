@@ -1,7 +1,7 @@
 # ClinVision fork of OfficeCLI
 
 This is a fork of [iOfficeAI/OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) (Apache License 2.0).
-The `clinvision` branch is based on upstream tag `v1.0.158` (`2900a4a2`). ClinVision vendors this
+The `clinvision` branch is based on upstream tag `v1.0.163` (`fecece3e`). ClinVision vendors this
 branch as source and builds it itself; it never installs an upstream release binary.
 
 ClinVision handles clinical data, so this build must not reach the network, change itself, or run
@@ -15,7 +15,7 @@ other programs on its own. Each change below is marked in its file with a `ClinV
 | Mermaid rendering is off: it loads its script from `d.officecli.ai` or jsDelivr and starts a browser. | `src/officecli/Core/Diagram/MermaidImageRenderer.cs` |
 | Plugin discovery finds nothing, so no external `officecli-*` program is started. | `src/officecli/Core/Plugins/PluginRegistry.cs` |
 | The Word preview never adds the web-font loader (it sent document font names to `d.officecli.ai` / Google Fonts). | `src/officecli/Handlers/Word/WordHandler.HtmlPreview.cs` |
-| `view html` output carries a Content-Security-Policy that blocks every network load; only inline content and data URIs render. This holds whether the command runs directly or through the resident process that `create` starts by default. | `src/officecli/CommandBuilder.View.cs`, `src/officecli/ResidentServer.cs` |
+| `view html` (and `view svg --browser` KaTeX wrapper) output carries a Content-Security-Policy that blocks every network load; only inline content and data URIs render. Both direct CLI and resident paths share `CommandBuilder.RunView`. | `src/officecli/CommandBuilder.ViewCore.cs` |
 | No headless browser is ever started, so `view screenshot`, DOM page counts (`--page-count`, grid sizing) and the Word TOC page-number refresh do nothing or report that no browser is available. Previews name CDN scripts (three.js, KaTeX) that a browser would fetch. | `src/officecli/Core/HtmlScreenshot.cs` |
 
 Not changed, and not used by ClinVision: `watch` (local HTTP preview server) and `mcp` and its

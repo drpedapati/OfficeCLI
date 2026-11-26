@@ -62,6 +62,17 @@ public static class IssueSubtypes
     /// skipped (a texture pulled over a background is intentional).</summary>
     public const string PictureAspectDistorted = "picture_aspect_distorted";
 
+    /// <summary>pptx-only: a preset geometry's <c>&lt;a:avLst&gt;</c> is one
+    /// PowerPoint refuses to open the file over — an adjust value the preset
+    /// does not declare, a partial set, or the set out of order. The schema
+    /// accepts all three, so <c>validate</c> passes. Structure bucket, Error.</summary>
+    public const string PresetAdjustRefused = "preset_adjust_refused";
+
+    /// <summary>docx: an inline picture sits in a paragraph whose effective
+    /// line spacing is <c>lineRule="exact"</c> and shorter than the picture.
+    /// Word clips the picture to the line height, so only a strip renders.</summary>
+    public const string PictureClippedByLineSpacing = "picture_clipped_by_line_spacing";
+
     /// <summary>Broad IssueType bucket names — the canonical surface shown
     /// in error messages and help. Single-letter aliases (<see cref="BucketAliases"/>)
     /// are accepted by Validate but kept out of the user-facing list so the
@@ -83,8 +94,8 @@ public static class IssueSubtypes
     public static readonly string[] ValidSubtypes = new[]
     {
         FormulaNotEvaluated, FormulaCacheStale, FormulaRefMissingSheet, FormulaEvalError,
-        FieldNotEvaluated, FieldCacheStale,
-        SlideFieldNotEvaluated, NotesUnresolvedRid, LowContrast, PictureAspectDistorted,
+        FieldNotEvaluated, FieldCacheStale, PictureClippedByLineSpacing,
+        SlideFieldNotEvaluated, NotesUnresolvedRid, LowContrast, PictureAspectDistorted, PresetAdjustRefused,
         ChartSeriesRefMissingSheet, ChartCacheStale,
         DefinedNameBroken, DefinedNameTargetMissing,
         BrokenPartRef, NumericOverflow, GeneralPrecisionLoss,
@@ -108,7 +119,7 @@ public static class IssueSubtypes
             + "Opt-in only (request by exact name; not included in --type content): "
             + string.Join(", ", OptInSubtypes) + ". "
             + "Subtypes are format-specific — formula_* / chart_* / definedname_* / numeric_overflow apply to xlsx, "
-            + "field_* to docx, slide_field_* / notes_unresolved_rid / broken_part_ref / low_contrast / picture_aspect_distorted to pptx; requesting a subtype that does not apply to "
+            + "field_* / picture_clipped_by_line_spacing to docx, slide_field_* / notes_unresolved_rid / broken_part_ref / low_contrast / picture_aspect_distorted / preset_adjust_refused to pptx; requesting a subtype that does not apply to "
             + "the queried file returns count=0 (not an error). "
             + "All values are case-insensitive and surrounding whitespace is trimmed.";
     }

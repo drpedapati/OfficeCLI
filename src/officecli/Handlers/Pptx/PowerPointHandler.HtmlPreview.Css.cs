@@ -208,6 +208,27 @@ public partial class PowerPointHandler
 
     // ==================== CSS Helper: Custom Geometry ====================
 
+    /// <summary>True when one &lt;a:path&gt; holds more than one subpath (a second
+    /// moveTo) or a subpath that draws something and is not ended by &lt;a:close/&gt;.
+    /// Neither can be expressed as a single closed clip-path polygon.</summary>
+    private static bool HasOpenOrMultipleSubpaths(Drawing.Path path)
+    {
+        int moves = 0;
+        bool drew = false, closed = false;
+        foreach (var child in path.ChildElements)
+        {
+            if (child is Drawing.MoveTo)
+            {
+                if (drew && !closed) return true;
+                if (++moves > 1) return true;
+                drew = closed = false;
+            }
+            else if (child is Drawing.CloseShapePath) closed = true;
+            else { drew = true; closed = false; }
+        }
+        return drew && !closed;
+    }
+
     /// <summary>
     /// Convert OOXML CustomGeometry (a:custGeom) path data to CSS clip-path.
     /// Supports moveTo, lineTo, cubicBezTo, quadBezTo, close.
@@ -1463,37 +1484,118 @@ public partial class PowerPointHandler
         return $"clip-path:polygon({string.Join(",", pts)})";
     }
 
-    /// <summary>R19 BUG A: parallelogram honoring adj1 (top-left x offset fraction
-    /// of width, ×100000; default 25000). polygon (a,0)(100,0)(100-a,100)(0,100).</summary>
-    private static string ParallelogramPolygon(Drawing.PresetGeometry? presetGeom)
+    /// <summary>
+    /// Horizontal inset of the parallelogram / trapezoid / chevron / hexagon /
+    /// homePlate presets, in the units of <paramref name="w"/>. ECMA-376 defines
+    /// it as <c>ss * adj / 100000</c> where ss is the SHORTER side, with adj
+    /// pinned to <c>maxOfWidth * w / ss</c> — so on a wide, short shape the
+    /// slant/point stays shallow instead of scaling with the width. Shared by
+    /// the HTML clip-path and the SVG preview. Unknown size → treat as square.
+    /// </summary>
+    internal static double ShortSideInset(Drawing.PresetGeometry? presetGeom, long defaultAdj,
+        double maxOfWidth, double w, double h)
     {
-        var a = Math.Clamp(ReadAdjValueCss(presetGeom, 0, 25000) / 100000.0 * 100.0, 0, 100);
-        return $"clip-path:polygon({a:0.##}% 0,100% 0,{100 - a:0.##}% 100%,0 100%)";
+        if (w <= 0 || h <= 0) { w = 1; h = 1; }
+        var ss = Math.Min(w, h);
+        var inset = ss * ReadAdjValueCss(presetGeom, 0, defaultAdj) / 100000.0;
+        return Math.Clamp(inset, 0, w * maxOfWidth);
     }
 
-    /// <summary>R19 BUG A: trapezoid honoring adj1 (top-edge inset from each side,
-    /// ×100000; default 25000). polygon (a,0)(100-a,0)(100,100)(0,100).</summary>
-    private static string TrapezoidPolygon(Drawing.PresetGeometry? presetGeom)
+    /// <summary>
+    /// Text rectangle of the parallelogram / trapezoid / chevron / hexagon /
+    /// homePlate presets, as insets from the shape's box (same units as
+    /// <paramref name="w"/> / <paramref name="h"/>). These follow the
+    /// <c>&lt;a:rect&gt;</c> each preset declares in ECMA-376 (presetShapeDefinitions),
+    /// which moves with adj — a chevron's text sits between its notch and its
+    /// point, a hexagon's between the slanted corners. The bodyPr insets apply
+    /// INSIDE this rectangle. Null for any other preset.
+    /// </summary>
+    internal static (double L, double T, double R, double B)? PresetTextRectInsets(
+        Drawing.PresetGeometry? presetGeom, double w, double h)
     {
-        var a = Math.Clamp(ReadAdjValueCss(presetGeom, 0, 25000) / 100000.0 * 100.0, 0, 50);
-        return $"clip-path:polygon({a:0.##}% 0,{100 - a:0.##}% 0,100% 100%,0 100%)";
+        var preset = presetGeom?.Preset?.InnerText;
+        if (preset == null || w <= 0 || h <= 0) return null;
+        var ss = Math.Min(w, h);
+        switch (preset)
+        {
+            case "chevron":
+            {
+                var x1 = ShortSideInset(presetGeom, 50000, 1.0, w, h);
+                // Once the notch passes the point's base there is no clear band
+                // left; the spec falls back to the full width.
+                return w - 2 * x1 > 0 ? (x1, 0, x1, 0) : (0, 0, 0, 0);
+            }
+            case "homePlate":
+                // Right edge halfway between the point's base and its tip.
+                return (0, 0, ShortSideInset(presetGeom, 50000, 1.0, w, h) / 2, 0);
+            case "parallelogram":
+            {
+                var maxAdj = 100000.0 * w / ss;
+                var a = Math.Clamp(ReadAdjValueCss(presetGeom, 0, 25000), 0, maxAdj);
+                var q = (1 + 5 * a / maxAdj) / 12;
+                return (q * w, q * h, q * w, q * h);
+            }
+            case "trapezoid":
+            {
+                var maxAdj = 50000.0 * w / ss;
+                var a = Math.Clamp(ReadAdjValueCss(presetGeom, 0, 25000), 0, maxAdj);
+                var il = w / 3 * a / maxAdj;
+                return (il, h / 3 * a / maxAdj, il, 0);
+            }
+            case "hexagon":
+            {
+                var maxAdj = 50000.0 * w / ss;
+                var a = Math.Clamp(ReadAdjValueCss(presetGeom, 0, 25000), 0, maxAdj);
+                var half = maxAdj / 2;
+                // Piecewise in adj, split at half of its range.
+                var q = a > half ? 4 + 3 * (a - half) / half : 2 + 2 * a / half;
+                return (w * q / 24, h * q / 24, w * q / 24, h * q / 24);
+            }
+            default:
+                return null;
+        }
     }
 
-    /// <summary>R19 BUG A: chevron (right-pointing) honoring adj1 (notch depth
-    /// fraction, ×100000; default 50000).
+    private static double ShortSideInsetPct(Drawing.PresetGeometry? presetGeom, long defaultAdj,
+        double maxOfWidth, long widthEmu, long heightEmu)
+    {
+        double w = widthEmu > 0 && heightEmu > 0 ? widthEmu : 1, h = widthEmu > 0 && heightEmu > 0 ? heightEmu : 1;
+        return ShortSideInset(presetGeom, defaultAdj, maxOfWidth, w, h) / w * 100.0;
+    }
+
+    private static string PctInv(double d) => d.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>parallelogram: adj (default 25000) = top-left x offset, relative
+    /// to the shorter side. polygon (a,0)(100,0)(100-a,100)(0,100).</summary>
+    private static string ParallelogramPolygon(Drawing.PresetGeometry? presetGeom, long widthEmu, long heightEmu)
+    {
+        var a = ShortSideInsetPct(presetGeom, 25000, 1.0, widthEmu, heightEmu);
+        return $"clip-path:polygon({PctInv(a)}% 0,100% 0,{PctInv(100 - a)}% 100%,0 100%)";
+    }
+
+    /// <summary>trapezoid: adj (default 25000) = top-edge inset from each side,
+    /// relative to the shorter side. polygon (a,0)(100-a,0)(100,100)(0,100).</summary>
+    private static string TrapezoidPolygon(Drawing.PresetGeometry? presetGeom, long widthEmu, long heightEmu)
+    {
+        var a = ShortSideInsetPct(presetGeom, 25000, 0.5, widthEmu, heightEmu);
+        return $"clip-path:polygon({PctInv(a)}% 0,{PctInv(100 - a)}% 0,100% 100%,0 100%)";
+    }
+
+    /// <summary>chevron (right-pointing): adj (default 50000) = point/notch depth,
+    /// relative to the shorter side.
     /// polygon (0,0)(100-a,0)(100,50)(100-a,100)(0,100)(a,50).</summary>
-    private static string ChevronPolygon(Drawing.PresetGeometry? presetGeom)
+    private static string ChevronPolygon(Drawing.PresetGeometry? presetGeom, long widthEmu, long heightEmu)
     {
-        var a = Math.Clamp(ReadAdjValueCss(presetGeom, 0, 50000) / 100000.0 * 100.0, 0, 100);
-        return $"clip-path:polygon(0 0,{100 - a:0.##}% 0,100% 50%,{100 - a:0.##}% 100%,0 100%,{a:0.##}% 50%)";
+        var a = ShortSideInsetPct(presetGeom, 50000, 1.0, widthEmu, heightEmu);
+        return $"clip-path:polygon(0 0,{PctInv(100 - a)}% 0,100% 50%,{PctInv(100 - a)}% 100%,0 100%,{PctInv(a)}% 50%)";
     }
 
-    /// <summary>R19 BUG A: hexagon honoring adj1 (corner inset fraction, ×100000;
-    /// default 25000). polygon (a,0)(100-a,0)(100,50)(100-a,100)(a,100)(0,50).</summary>
-    private static string HexagonPolygon(Drawing.PresetGeometry? presetGeom)
+    /// <summary>hexagon: adj (default 25000) = corner inset, relative to the
+    /// shorter side. polygon (a,0)(100-a,0)(100,50)(100-a,100)(a,100)(0,50).</summary>
+    private static string HexagonPolygon(Drawing.PresetGeometry? presetGeom, long widthEmu, long heightEmu)
     {
-        var a = Math.Clamp(ReadAdjValueCss(presetGeom, 0, 25000) / 100000.0 * 100.0, 0, 100);
-        return $"clip-path:polygon({a:0.##}% 0,{100 - a:0.##}% 0,100% 50%,{100 - a:0.##}% 100%,{a:0.##}% 100%,0 50%)";
+        var a = ShortSideInsetPct(presetGeom, 25000, 0.5, widthEmu, heightEmu);
+        return $"clip-path:polygon({PctInv(a)}% 0,{PctInv(100 - a)}% 0,100% 50%,{PctInv(100 - a)}% 100%,{PctInv(a)}% 100%,0 50%)";
     }
 
     // ---- R18 BUG B/D/E: sector / ring / segment geometry --------------------
@@ -2384,6 +2486,8 @@ public partial class PowerPointHandler
     private static string PresetGeometryToCss(string preset, long widthEmu, long heightEmu,
         Drawing.PresetGeometry? presetGeom)
     {
+        // Wedge callouts: tail tip follows adj1/adj2 (ECMA preset formulas).
+        if (IsWedgeCallout(preset)) return WedgeCalloutClipPath(preset, widthEmu, heightEmu, presetGeom) ?? "";
         // R18: sector / ring / segment presets honoring avLst angles
         if (preset == "pie") return PieSectorPolygon(presetGeom);
         if (preset == "arc") return ArcWedgePolygon(presetGeom);
@@ -2423,10 +2527,10 @@ public partial class PowerPointHandler
             return "clip-path:polygon(53.06% 20.1%,68.47% 0%,67.25% 26.75%,83.37% 14.69%,75.83% 30.24%,100% 30.76%,78.63% 43.53%,84.58% 52.27%,75.83% 56.99%,87.39% 72.37%,67.78% 66.44%,69.18% 80.42%,56.39% 73.77%,53.76% 87.23%,45.7% 80.42%,40.28% 91.26%,34.85% 83.91%,22.76% 100%,22.25% 84.44%,5.95% 82.52%,15.42% 71.16%,0% 59.62%,18.22% 53.67%,5.43% 38.29%,24.87% 36.19%,20.84% 16.78%,39.58% 29.55%,45.01% 8.74%)";
 
         // R19 BUG A: parametric quads/polys honoring avLst (slant/notch/inset)
-        if (preset == "parallelogram") return ParallelogramPolygon(presetGeom);
-        if (preset == "trapezoid") return TrapezoidPolygon(presetGeom);
-        if (preset == "chevron") return ChevronPolygon(presetGeom);
-        if (preset == "hexagon") return HexagonPolygon(presetGeom);
+        if (preset == "parallelogram") return ParallelogramPolygon(presetGeom, widthEmu, heightEmu);
+        if (preset == "trapezoid") return TrapezoidPolygon(presetGeom, widthEmu, heightEmu);
+        if (preset == "chevron") return ChevronPolygon(presetGeom, widthEmu, heightEmu);
+        if (preset == "hexagon") return HexagonPolygon(presetGeom, widthEmu, heightEmu);
         // triangle/isosTriangle: adj = apex horizontal position (fraction*100000,
         // default 50000 = centered). A non-default adj shifts the apex, making a
         // scalene triangle; the old hardcoded 50% ignored it.
@@ -2505,15 +2609,12 @@ public partial class PowerPointHandler
         // corner (L-shape): adj1 = bottom (horizontal) arm height %, adj2 = left
         // (vertical) arm width %; both default 50000. Inner corner at (adj2, 100-adj1).
         // The old hardcoded 50/50 ignored both, so a thin-armed L looked fat.
-        // homePlate (pentagon arrow): adj = point depth as a fraction of width
-        // (default 25000 = 25%). The body occupies (100-adj)%, the triangular point
-        // the rest. The old hardcoded 75%/25% ignored adj.
+        // homePlate (pentagon arrow): adj (default 50000) = point depth relative
+        // to the SHORTER side, so a wide, short plate keeps a shallow point.
         if (preset == "homePlate")
         {
-            var ptPct = Math.Clamp(ReadAdjValueCss(presetGeom, 0, 25000) / 1000.0, 0, 100);
-            var bodyPct = 100 - ptPct;
-            string P(double d) => d.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
-            return $"clip-path:polygon(0 0,{P(bodyPct)}% 0,100% 50%,{P(bodyPct)}% 100%,0 100%)";
+            var bodyPct = 100 - ShortSideInsetPct(presetGeom, 50000, 1.0, widthEmu, heightEmu);
+            return $"clip-path:polygon(0 0,{PctInv(bodyPct)}% 0,100% 50%,{PctInv(bodyPct)}% 100%,0 100%)";
         }
         if (preset == "corner")
         {
@@ -2663,9 +2764,6 @@ public partial class PowerPointHandler
             "stripedRightArrow" => "clip-path:polygon(10% 20%,12% 20%,12% 80%,10% 80%,10% 20%,15% 20%,70% 20%,70% 0,100% 50%,70% 100%,70% 80%,15% 80%)",
 
             // Callouts — rectangle/rounded-rect/ellipse body with a wedge tail pointing down-left
-            "wedgeRectCallout" => "clip-path:polygon(0 0,100% 0,100% 75%,40% 75%,10% 100%,30% 75%,0 75%)",
-            "wedgeRoundRectCallout" => "clip-path:polygon(8% 0%,92% 0%,95% 1%,98% 3%,100% 5%,100% 8%,100% 67%,100% 70%,98% 73%,95% 75%,92% 75%,40% 75%,10% 100%,30% 75%,8% 75%,5% 75%,2% 73%,1% 70%,0% 67%,0% 8%,0% 5%,1% 3%,2% 1%,5% 0%)",
-            "wedgeEllipseCallout" => "clip-path:polygon(50% 0%,60% 1%,70% 3%,78% 7%,85% 13%,90% 20%,94% 28%,97% 37%,98% 47%,97% 56%,95% 64%,91% 71%,40% 75%,10% 100%,35% 72%,27% 76%,19% 72%,12% 65%,7% 57%,3% 48%,2% 38%,3% 29%,6% 20%,11% 13%,18% 7%,26% 3%,35% 1%,42% 0%)",
 
             // Crosses and plus — arm width scales with aspect ratio
             "plus" or "cross" => PlusPolygon(presetGeom),
