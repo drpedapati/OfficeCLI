@@ -925,6 +925,13 @@ public partial class WordHandler
         // override win over abstractNum continuation even when a deeper item
         // appeared first and carried the level over (ECMA-376 §17.9.7).
         public readonly HashSet<int> PendingInstanceOverride = new();
+        // (numId, ilvl) overrides that have already fired. A startOverride marks
+        // where the num INSTANCE starts; a later paragraph of the same numId,
+        // after another list intervened, continues the instance (Word: 1, 2,
+        // then list B, then 3) instead of restarting. An lvlRestart-triggered
+        // restart of a deeper level re-arms its override (see
+        // AdvanceOrderedCounter), so sublists still restart at the override.
+        public readonly HashSet<(int NumId, int Ilvl)> ConsumedInstanceOverride = new();
     }
 
     /// <summary>
@@ -968,6 +975,7 @@ public partial class WordHandler
             // to the override value (matches Word). A fresh level (not continued)
             // still takes the override as its initial start.
             if (ovr.HasValue
+                && !st.ConsumedInstanceOverride.Contains((numId, forIlvl))
                 && !(continuedRun.HasValue && GetEffectiveLvlRestart(numId, forIlvl) == 0))
                 return SeedBelow(ovr.Value);
         }
@@ -991,12 +999,13 @@ public partial class WordHandler
         var lvlOverride = inst?.Elements<LevelOverride>()
             .FirstOrDefault(o => o.LevelIndex?.Value == ilvl);
         if (lvlOverride?.GetFirstChild<Level>() is Level emb)
-            return emb.StartNumberingValue?.Val?.Value ?? 1;
+            return emb.StartNumberingValue?.Val?.Value ?? 0;
         var absId = inst?.AbstractNumId?.Val?.Value;
         var abs = FindAbstractNum(numbering, absId);
         var lvl = abs?.Elements<Level>()
             .FirstOrDefault(l => l.LevelIndex?.Value == ilvl);
-        return lvl?.StartNumberingValue?.Val?.Value ?? 1;
+        // Absent <w:start> on an existing level means 0 (ECMA-376 §17.9.26).
+        return lvl == null ? 1 : (lvl.StartNumberingValue?.Val?.Value ?? 0);
     }
 
     // The per-num-instance override start for a level, or null when this num has
@@ -1050,7 +1059,8 @@ public partial class WordHandler
         st.PendingInstanceOverride.Clear();
         for (int lv = 0; lv <= 8; lv++)
             if (GetNumInstanceOverrideStart(numId, lv).HasValue
-                && GetEffectiveLvlRestart(numId, lv) != 0)
+                && GetEffectiveLvlRestart(numId, lv) != 0
+                && !st.ConsumedInstanceOverride.Contains((numId, lv)))
                 st.PendingInstanceOverride.Add(lv);
     }
 
@@ -1123,6 +1133,9 @@ public partial class WordHandler
             // Saturate at int.MaxValue to avoid overflow when w:start is INT_MAX.
             st.OlCountPerLevel[ilvl] = prev == int.MaxValue ? int.MaxValue : prev + 1;
         }
+        // This level has now been advanced directly under this num: its
+        // instance override is spent until an lvlRestart restarts the level.
+        st.ConsumedInstanceOverride.Add((numId, ilvl));
         st.MultiLevelCounters[ilvl] = st.OlCountPerLevel[ilvl];
         for (int lk = ilvl + 1; lk <= 8; lk++)
         {
@@ -1135,6 +1148,13 @@ public partial class WordHandler
             // 5). Verified vs real Word.
             st.OlCountPerLevel.Remove(lk);
             st.MultiLevelCounters.Remove(lk);
+            // A restarted deeper level starts over, so its instance override
+            // applies again on its next direct advance.
+            if (GetNumInstanceOverrideStart(numId, lk).HasValue)
+            {
+                st.ConsumedInstanceOverride.Remove((numId, lk));
+                st.PendingInstanceOverride.Add(lk);
+            }
         }
         if (absId.HasValue)
         {
@@ -1480,7 +1500,11 @@ public partial class WordHandler
         var level = abstractNum?.Elements<Level>()
             .FirstOrDefault(l => l.LevelIndex?.Value == ilvl);
 
-        return level?.StartNumberingValue?.Val?.Value;
+        // ECMA-376 §17.9.26: a level that omits <w:start> starts at ZERO, not
+        // one (Word renders 0., 1., 2. — 0-10 rating scales are written this
+        // way). Only a level that does not exist at all falls back to 1.
+        if (level == null) return null;
+        return level.StartNumberingValue?.Val?.Value ?? 0;
     }
 
     /// <summary>

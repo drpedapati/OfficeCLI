@@ -184,6 +184,8 @@ public partial class WordHandler
         sb.AppendLine($"<html lang=\"{HtmlEncode(htmlLang)}\"{dirAttr}>");
         sb.AppendLine("<head>");
         sb.AppendLine("<meta charset=\"UTF-8\">");
+        // First thing after the charset: a meta policy only governs what follows.
+        sb.AppendLine(Core.PreviewCsp.MetaTag);
         sb.AppendLine("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");
         sb.AppendLine($"<title>{HtmlEncode(Path.GetFileName(_filePath))}</title>");
         var pgLayout = GetPageLayout();
@@ -259,7 +261,7 @@ public partial class WordHandler
                 // Sanitized names contain only letters/digits/space/.-_ so plain
                 // quote-wrapping is JSON-safe (no escapable characters survive).
                 var famJson = "[" + string.Join(",", webFontCandidates.Select(f => $"\"{f}\"")) + "]";
-                sb.AppendLine("<script>(function(){");
+                sb.AppendLine($"<script{Core.PreviewCsp.NonceAttr}>(function(){{");
                 sb.AppendLine($"var fams={famJson};");
                 sb.AppendLine("function w(f,fb){var c=w.c||(w.c=document.createElement('canvas').getContext('2d'));c.font='72px '+(f?'\"'+f+'\",':'')+fb;return c.measureText('mmmmmmmmmmlliWW@#\\u5e05\\u6c38\\u306e\\ud55c').width;}");
                 sb.AppendLine("function has(f){try{return w(f,'monospace')!==w(null,'monospace')||w(f,'serif')!==w(null,'serif');}catch(e){return true;}}");
@@ -278,8 +280,7 @@ public partial class WordHandler
         if (hasMathFormulas)
         {
             // CONSISTENCY(katex-mirror): mirror-first with CDN fallback chain — see Core/KatexAssets.
-            sb.AppendLine($"<link rel=\"stylesheet\" href=\"{Core.KatexAssets.CssUrl}\" media=\"print\" onload=\"this.media='all'\" onerror=\"{Core.KatexAssets.CssOnErrorJs}\">");
-            sb.AppendLine($"<script defer src=\"{Core.KatexAssets.JsUrl}\" onerror=\"{Core.KatexAssets.JsOnErrorJs("document.querySelectorAll('.katex-formula').forEach(function(el){el.textContent=el.dataset.formula;el.style.fontFamily='monospace';el.style.color='#666'})")}\"></script>");
+            sb.AppendLine(Core.KatexAssets.HeadTags("document.querySelectorAll('.katex-formula').forEach(function(el){el.textContent=el.dataset.formula;el.style.fontFamily='monospace';el.style.color='#666'})"));
         }
         sb.AppendLine("</head>");
         sb.AppendLine("<body>");
@@ -444,6 +445,19 @@ public partial class WordHandler
             int firstSectIdxOnPage = sectMatches.Count > 0
                 ? int.Parse(sectMatches[0].Groups[1].Value)
                 : -1;
+            // A page that OPENS with an oddPage/evenPage section must land on a
+            // page number of that parity; Word inserts a blank page before it
+            // when the running count says otherwise. The final page numbers are
+            // only known after client-side pagination, so tag the wrapper and
+            // let the paginator insert the blank (applyParityFillers).
+            string sectionStartAttr = "";
+            if (firstSectIdxOnPage > 0 && firstSectIdxOnPage < sections.Count
+                && pgContent.TrimStart().StartsWith($"<!--SECT:{firstSectIdxOnPage}-->", StringComparison.Ordinal))
+            {
+                var startType = sections[firstSectIdxOnPage].GetFirstChild<SectionType>()?.Val?.Value;
+                if (startType == SectionMarkValues.OddPage) sectionStartAttr = " data-section-start=\"odd\"";
+                else if (startType == SectionMarkValues.EvenPage) sectionStartAttr = " data-section-start=\"even\"";
+            }
             if (sectMatches.Count > 0)
             {
                 var lastIdx = int.Parse(sectMatches[^1].Groups[1].Value);
@@ -523,7 +537,7 @@ public partial class WordHandler
                         $" data-line-num-restart=\"{restart}\"";
                 }
             }
-            sb.AppendLine($"<div class=\"page-wrapper\" data-section=\"{i + 1}\" data-section-idx=\"{activeSectionIdx}\"{lineNumAttrs}>");
+            sb.AppendLine($"<div class=\"page-wrapper\" data-section=\"{i + 1}\" data-section-idx=\"{activeSectionIdx}\"{sectionStartAttr}{lineNumAttrs}>");
             sb.AppendLine($"<div class=\"page\" data-page=\"{i + 1}\" style=\"{pageStyle}\">");
             // #3: per-page header/footer selection. titlePg → first-page
             // variant; evenAndOddHeaders + even-numbered page → even
@@ -605,7 +619,7 @@ public partial class WordHandler
 
         // Auto-pagination script: split overflowing pages and KaTeX rendering
         var bodyHeightPt = pgLayout.HeightPt - pgLayout.MarginTopPt - pgLayout.MarginBottomPt;
-        sb.AppendLine("<script>");
+        sb.AppendLine($"<script{Core.PreviewCsp.NonceAttr}>");
         sb.AppendLine("function _wordInit(){");
         sb.AppendLine("  if(typeof katex!=='undefined'){");
         sb.AppendLine("    document.querySelectorAll('.katex-formula:not(.katex-rendered)').forEach(function(el){");
@@ -760,10 +774,39 @@ public partial class WordHandler
     var pad=needed>base?needed:base;
     page.style.paddingTop=pad+'px';
   }
+  // oddPage / evenPage sections: the section's first page must have that
+  // parity, so Word puts a blank page in front of it when the running page
+  // count would give the other one. Rebuilt from scratch on every pass —
+  // an earlier page splitting flips the parity of everything after it.
+  function applyParityFillers(){
+    document.querySelectorAll('.page-wrapper[data-parity-filler]').forEach(function(w){w.remove();});
+    var count=0,prev=null;
+    Array.from(document.querySelectorAll('.page-wrapper')).forEach(function(w){
+      var want=w.getAttribute('data-section-start');
+      if(want&&prev&&((want==='odd')!==((count+1)%2===1))){
+        var fw=document.createElement('div');
+        fw.className='page-wrapper';
+        fw.setAttribute('data-parity-filler','1');
+        var fp=document.createElement('div');
+        fp.className='page';
+        var pp=prev.querySelector('.page');
+        if(pp)fp.style.cssText=pp.style.cssText;
+        var fb=document.createElement('div');
+        fb.className='page-body';
+        fp.appendChild(fb);
+        fw.appendChild(fp);
+        w.before(fw);
+        count++;
+      }
+      count++;
+      prev=w;
+    });
+  }
   function paginate(){
     // Reflow tall headers BEFORE measuring body overflow so the pushed-down
     // body height is accounted for when picking split points.
     document.querySelectorAll('.page').forEach(adjustHeaderPadding);
+    syncFootnotes();
     var pages=document.querySelectorAll('.page');
     // Sync mode + page filter: bail once pages beyond max-requested exist
     // and pages 1..maxReq are stable. Avoids paginating 100-page docs to
@@ -787,13 +830,16 @@ public partial class WordHandler
           });
           if(sch>maxBodyH-sfH+2){settled=false;break;}
         }
-        if(settled){positionFootnotes();wrapFloats();applyLineNumbers();applyPageFilter();return;}
+        if(settled){positionFootnotes();wrapFloats();applyLineNumbers();applyPageFilter();if(window._gridCols>0){layoutGrid(window._gridCols);}else{flushScreenshotPage();}return;}
       }
     }
     for(var pi=0;pi<loopLim;pi++){
       var page=pages[pi];
       var body=page.querySelector('.page-body');
       if(!body)continue;
+      // Earlier splits in this pass may have carried references onto this
+      // page (or off the previous one); re-home their notes before measuring.
+      syncFootnotes();
       // Reserve space for footnotes at page bottom (like Word does)
       var fnEl=body.querySelector('.footnotes');
       var fnH=fnEl?fnEl.offsetHeight:0;
@@ -1035,6 +1081,7 @@ public partial class WordHandler
         else page.after(nw);
       }
     }
+    applyParityFillers();
     // Renumber pages
     var allPages=document.querySelectorAll('.page');
     allPages.forEach(function(p,i){
@@ -1049,6 +1096,7 @@ public partial class WordHandler
     // another split when it has more than one visible child — otherwise the
     // single element is irreducible and we would recurse forever.
     var again=false;
+    syncFootnotes();
     var rcAll=document.querySelectorAll('.page');
     var rcLim=rcAll.length;
     if(window._wpSync&&window._requestedPages&&window._requestedPages.length){
@@ -1083,7 +1131,7 @@ public partial class WordHandler
       document.querySelectorAll('a[id^=""_Toc""]').forEach(function(a){
         for(var i=0;i<pgs.length;i++) if(pgs[i].contains(a)){pmap.push(a.id+'='+(i+1));break;}
       });
-      if(window._gridCols>0){layoutGrid(window._gridCols);}
+      if(window._gridCols>0){applyPageFilter();layoutGrid(window._gridCols);}
       else{applyPageFilter();flushScreenshotPage();}
       document.title='PAGES:'+pgs.length+(pmap.length?'|MAP:'+pmap.join(','):'');
     }
@@ -1201,6 +1249,40 @@ public partial class WordHandler
       runningNum=current+lineTops.length;
     });
   }
+  // Footnotes belong at the bottom of the page that holds their reference.
+  // The server emits every entry in one .footnotes block on the first page
+  // with a reference; re-home each #fnN next to its #fnrefN before every
+  // pagination measure, so a page reserves room only for its own notes.
+  function syncFootnotes(){
+    var blocks=Array.from(document.querySelectorAll('.page-body > .footnotes'));
+    if(!blocks.length)return;
+    var tmpl=blocks[0].cloneNode(false);
+    var sep=blocks[0].querySelector(':scope > hr');
+    var entries=[];
+    blocks.forEach(function(b){Array.from(b.children).forEach(function(c){
+      if(c.id&&c.id.indexOf('fn')===0&&c.id.indexOf('fnref')!==0)entries.push(c);});});
+    var byBody=new Map();
+    entries.forEach(function(e){
+      var ref=document.getElementById('fnref'+e.id.substring(2));
+      var host=ref&&!ref.closest('.footnotes')?ref.closest('.page-body'):null;
+      if(!host)host=e.closest('.page-body');
+      if(!host)return;
+      if(!byBody.has(host))byBody.set(host,[]);
+      byBody.get(host).push(e);
+    });
+    blocks.forEach(function(b){if(!byBody.has(b.parentNode))b.remove();});
+    byBody.forEach(function(list,body){
+      var blk=body.querySelector(':scope > .footnotes');
+      if(!blk){
+        blk=tmpl.cloneNode(false);blk.style.marginTop='';
+        if(sep)blk.appendChild(sep.cloneNode(true));
+        var en=body.querySelector(':scope > .endnotes');
+        if(en)body.insertBefore(blk,en);else body.appendChild(blk);
+      }
+      list.forEach(function(e){blk.appendChild(e);});
+      blk.style.marginTop='';
+    });
+  }
   function positionFootnotes(){
     document.querySelectorAll('.page').forEach(function(page){
       var body=page.querySelector('.page-body');
@@ -1222,9 +1304,25 @@ public partial class WordHandler
     var rf=window._requestedPages;
     if(!rf||rf.length===0)return;
     var rSet=new Set(rf);
-    document.querySelectorAll('.page').forEach(function(p,i){
+    var pgs=document.querySelectorAll('.page');
+    var shown=0;
+    pgs.forEach(function(p,i){
       if(!rSet.has(i+1))p.style.display='none';
+      else shown++;
     });
+    // None of the requested pages exists. The CLI rejects this up front when
+    // it can count the pages, but that needs a headless browser on the host;
+    // without one this file is the only place the count is known. Say so
+    // instead of leaving a blank preview.
+    var old=document.getElementById('page-filter-notice');
+    if(old)old.remove();
+    if(shown===0&&pgs.length>0){
+      var n=document.createElement('div');
+      n.id='page-filter-notice';
+      n.textContent='--page '+rf.join(',')+' is out of range: this document has '+pgs.length+(pgs.length===1?' page.':' pages.');
+      n.style.cssText='margin:48px auto;max-width:480px;padding:16px 20px;font:14px/1.5 system-ui,sans-serif;color:#7a2e0e;background:#fff4e5;border:1px solid #f0c48a;border-radius:6px;text-align:center';
+      document.body.insertBefore(n,document.body.firstChild);
+    }
   }
   // Single-page screenshot: clip the one visible page to its page box and drop
   // the chrome (gray body padding, drop-shadow, rounded corners, wrapper margin)
@@ -1258,7 +1356,14 @@ public partial class WordHandler
     var avail=document.body.clientWidth-2*pad;
     var cellW=Math.floor((avail-(cols-1)*gap)/cols);
     if(cellW<1)cellW=window._gridCellW||220;
-    var wraps=Array.prototype.filter.call(document.querySelectorAll('.page-wrapper'),function(w){return w.offsetParent!==null;});
+    // A --page range hides the pages outside it (applyPageFilter); their
+    // wrappers must not take a cell, so hide them too and tile the rest.
+    var wraps=Array.prototype.filter.call(document.querySelectorAll('.page-wrapper'),function(w){
+      if(w.offsetParent===null)return false;
+      var pg=w.querySelector('.page');
+      if(pg&&pg.style.display==='none'){w.style.display='none';return false;}
+      return true;
+    });
     wraps.forEach(function(wrapper){
       var page=wrapper.querySelector('.page');if(!page)return;
       var pageW=page.offsetWidth,pageH=page.offsetHeight;
@@ -2483,7 +2588,6 @@ public partial class WordHandler
         // "continue" behavior) unless a <w:lvlOverride><w:startOverride/>
         // resets it. The HTML path keeps currentNumId locally for nesting.
         var olState = new OrderedListNumberingState();
-        var headingCounters = new Dictionary<int, int>(); // ilvl → counter for heading auto-numbering from style numPr
         bool pendingLiClose = false; // defer </li> to allow nested lists inside
         bool inMultiColumn = false; // track whether we're inside a multi-column div
 
@@ -2651,9 +2755,31 @@ public partial class WordHandler
                 // pointed at a later section than the page's real owner —
                 // flipping page-1 header/footer selection to the wrong
                 // section's variant.
-                var sectTypeVal = prevInlineSectPr.GetFirstChild<SectionType>()?.Val?.Value;
-                if (sectTypeVal != SectionMarkValues.Continuous
-                    && sectTypeVal != SectionMarkValues.NextColumn)
+                //
+                // The type that decides this is the one on the section being
+                // ENTERED: a sectPr's <w:type> says how its own section starts
+                // (§17.6.22), not how the next one does. Reading it off the
+                // sectPr that closes the section being left shifted every break
+                // by one section — a trailing `continuous` section after a
+                // nextPage one got a page of its own.
+                //
+                // A continuous section whose page size or orientation differs
+                // from the section before it cannot share that page, so Word
+                // starts it on a new page regardless of its type.
+                var enteredSectPr = currentSectionIdx + 1 < allSections.Count
+                    ? allSections[currentSectionIdx + 1] : null;
+                var sectTypeVal = enteredSectPr?.GetFirstChild<SectionType>()?.Val?.Value;
+                bool staysOnPage = sectTypeVal == SectionMarkValues.Continuous
+                    || sectTypeVal == SectionMarkValues.NextColumn;
+                if (staysOnPage && enteredSectPr != null)
+                {
+                    var leftPage = GetPageLayoutFor(prevInlineSectPr);
+                    var enteredPage = GetPageLayoutFor(enteredSectPr);
+                    if (Math.Abs(leftPage.WidthPt - enteredPage.WidthPt) > 0.5
+                        || Math.Abs(leftPage.HeightPt - enteredPage.HeightPt) > 0.5)
+                        staysOnPage = false;
+                }
+                if (!staysOnPage)
                 {
                     sb.Append("<!--PAGE_BREAK-->");
                 }
@@ -2876,17 +3002,11 @@ public partial class WordHandler
                     // even when a deeper item carried the level over. Mirrors the
                     // text path (GetListPrefix), which arms on every CurrentNumId
                     // change — both feed the same AdvanceOrderedCounter.
-                    if (numId != currentNumId)
-                    {
-                        olState.PendingInstanceOverride.Clear();
-                        // Skip lvlRestart="0" levels: a never-restart continued
-                        // level keeps counting across the switch rather than
-                        // jumping to the override value (see GetListPrefix).
-                        for (int lv = 0; lv <= 8; lv++)
-                            if (GetNumInstanceOverrideStart(numId, lv).HasValue
-                                && GetEffectiveLvlRestart(numId, lv) != 0)
-                                olState.PendingInstanceOverride.Add(lv);
-                    }
+                    // EnterOrderedNum keys on the SHARED state's active num, so a
+                    // list switch that happened inside a table cell (#512) is
+                    // seen here too — the body list after the cell list used to
+                    // continue the cell list's count (4, 5 instead of 1, 2).
+                    EnterOrderedNum(olState, numId);
 
                     // When numId changes, decide: nesting or new list
                     if (currentNumId != null && numId != currentNumId)
@@ -3203,31 +3323,20 @@ public partial class WordHandler
                     var hNumPr = IsNumberingSuppressed(para) ? null : ResolveNumPrFromStyle(para);
                     if (hNumPr is { } hn)
                     {
-                        headingCounters[hn.Ilvl] = headingCounters.GetValueOrDefault(hn.Ilvl, 0) + 1;
-                        // Reset deeper level counters whenever a shallower heading ticks.
-                        for (int lk = hn.Ilvl + 1; lk <= 8; lk++)
-                            if (headingCounters.ContainsKey(lk)) headingCounters[lk] = 0;
+                        // A style-numbered heading is an item of its list like
+                        // any other: advance the SHARED ordered-list state so a
+                        // later list paragraph on the same abstractNum sees the
+                        // level-0 count the headings reached ("3.9", not "1.9"),
+                        // exactly as the text walker already does.
+                        var hAbsId = GetAbstractNumId(hn.NumId);
+                        EnterOrderedNum(olState, hn.NumId);
+                        AdvanceOrderedCounter(olState, hn.NumId, hAbsId, hn.Ilvl);
+                        olState.CurrentNumId = hn.NumId;
 
                         var lvlText = GetLevelText(hn.NumId, hn.Ilvl);
                         if (!string.IsNullOrEmpty(lvlText))
                         {
-                            // Only %1..%9 are valid Word level placeholders.
-                            // Match the RenderOrderedMarker hardening: restrict
-                            // to %1-%9 (so %0 / %x stays literal) and emit ""
-                            // for a placeholder whose fmt resolves to "bullet"
-                            // or an undefined level — otherwise a heading number
-                            // gets polluted with a • glyph and diverges from
-                            // view text. See WordHandler.StyleList.cs
-                            // RenderOrderedMarker.
-                            var numStr = System.Text.RegularExpressions.Regex.Replace(lvlText, @"%([1-9])", m =>
-                            {
-                                var lk = int.Parse(m.Groups[1].Value) - 1;
-                                var lvlFmt = GetNumberingFormat(hn.NumId, lk);
-                                if (lvlFmt.Equals("bullet", StringComparison.OrdinalIgnoreCase))
-                                    return "";
-                                var counter = headingCounters.GetValueOrDefault(lk, 0);
-                                return OfficeCli.Core.WordNumFmtRenderer.Render(counter, lvlFmt);
-                            });
+                            var numStr = RenderOrderedMarker(olState, hn.NumId, hn.Ilvl, lvlText);
                             // Skip the auto-num span when the paragraph text
                             // already begins with the computed number, so a
                             // user-typed "1. Overview" does not render as

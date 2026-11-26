@@ -200,6 +200,14 @@ internal sealed class FormulaEvalSession
     // cycle-free evaluations are stored; the seed-0 value a circular chain
     // returns depends on the entry point and must never be reused.
     internal readonly Dictionary<string, FormulaResult> CellMemo = new(StringComparer.OrdinalIgnoreCase);
+    // Results that DID hit the circular fallback, kept only for the current
+    // root evaluation (cleared when a new top-level formula starts). Within one
+    // root the cycle is broken at a fixed point, so re-evaluating the same cell
+    // again cannot produce a different value; without this memo every cell
+    // downstream of a 0-seeded cycle was recomputed on each reference and an
+    // auto-number chain over a self-referencing seed took exponential time
+    // (issue #456: 22 rows → 56 s, 240 rows → never finished).
+    internal readonly Dictionary<string, FormulaResult> CycleMemo = new(StringComparer.OrdinalIgnoreCase);
     // Populated-extent cache for whole-column/row clamping ("A:A" → used rows).
     // Keyed by SheetData reference; evaluation never adds/removes rows or cells,
     // so the extent is stable for the session's lifetime.
@@ -222,6 +230,57 @@ internal sealed class FormulaEvalSession
     internal readonly Dictionary<SharedStringTable, List<SharedStringItem>> SharedStringItemsByTable = new();
     internal int CircularHits;
     internal int CrossSheetDepth;
+    // True while a top-level TryEvaluateFull owns the stack. A referenced cell
+    // reached too deep in a dependency chain is then handed back to that
+    // top-level loop (PrecedentDeferredException) and computed from a shallow
+    // stack, instead of recursing until a guard turns the chain into #NUM!.
+    internal bool Driving;
+    // Expression nesting currently on the call stack, summed over every formula
+    // in flight (one unit per ParseConcat entry). This is what stack use is
+    // proportional to: a chain link costs one unit, a link wrapped in 30 IFs
+    // costs 31.
+    internal int NestingInFlight;
+    // The cells of Visiting that the evaluation now on the call stack entered,
+    // in order. A deferral takes this list with it (the cells are un-visited
+    // as the stack unwinds) so the top-level loop can keep them marked while
+    // the deferred cell is computed.
+    internal readonly List<string> InFlight = new();
+    // Results of cells computed by the top-level loop for the current root
+    // evaluation. Consulted before the guards, so a deferred cell is never
+    // deferred twice — including results CellMemo refuses to keep (cached-value
+    // fallback, circular seed). CycleDependent marks a result that met the
+    // circular fallback, so a formula that consumes it is not memoized as
+    // clean. Cleared with CycleMemo when a new root starts.
+    internal readonly Dictionary<string, (FormulaResult? Result, bool CycleDependent)> Deferred = new(StringComparer.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// Unwinds an evaluation that reached a depth/stack guard on a referenced
+/// formula cell. The top-level loop in <c>TryEvaluateFull</c> computes
+/// <see cref="CellRef"/> on <see cref="Evaluator"/> from a shallow stack and
+/// re-runs the formula that needed it. Long dependency chains (a running
+/// balance down 5,000 rows read from its last row, or a chain that points
+/// downward) therefore evaluate at any length, as they do in Excel.
+/// </summary>
+internal sealed class PrecedentDeferredException : Exception
+{
+    internal FormulaEvaluator Evaluator { get; }
+    internal string CellRef { get; }
+    internal string Key { get; }
+    // The cells that were in flight above the deferred one when it was
+    // deferred. Kept marked as visiting while it is computed, so a reference
+    // back to any of them is still seen as circular, exactly as it would have
+    // been had the recursion continued.
+    internal List<string> Ancestors { get; }
+    internal PrecedentDeferredException(FormulaEvaluator evaluator, string cellRef, string key, List<string> inFlight)
+    {
+        Evaluator = evaluator;
+        CellRef = cellRef;
+        Key = key;
+        Ancestors = new List<string>(inFlight);
+        if (Ancestors.Count > 0 && string.Equals(Ancestors[^1], key, StringComparison.OrdinalIgnoreCase))
+            Ancestors.RemoveAt(Ancestors.Count - 1);
+    }
 }
 
 internal partial class FormulaEvaluator
@@ -258,6 +317,12 @@ internal partial class FormulaEvaluator
     // circular refs separately. Over either limit → visible #NUM! (propagates up
     // the arithmetic chain), never a silent 0 nor a crash.
     private const int MaxSameSheetDepth = 1000;
+    // Nesting (see FormulaEvalSession.NestingInFlight) at which a referenced
+    // formula cell is deferred to the top-level loop instead of evaluated in
+    // place. One unit measures roughly 8–11 KB of stack in a release build, so
+    // 40 keeps an evaluation within about half a megabyte — inside a 1 MB
+    // Windows main thread with room left for the exception to unwind.
+    private const int MaxNestingInFlight = 40;
     private int _sameSheetDepth;
 
     // CONSISTENCY(dos-hardening): the expression parser is recursive-descent;
@@ -319,16 +384,72 @@ internal partial class FormulaEvaluator
 
     public FormulaResult? TryEvaluateFull(string formula)
     {
+        // A nested call (an evaluation is already in flight on this session)
+        // must let a deferral travel up to the loop that owns the stack.
+        if (_session.Driving) return EvaluateRoot(formula);
+
+        _session.Driving = true;
         try
         {
-            if (_depth == 0) { _visiting.Clear(); _expandingNames.Clear(); }
+            _session.Deferred.Clear();
+            while (true)
+            {
+                PrecedentDeferredException deferred;
+                try { return EvaluateRoot(formula); }
+                catch (PrecedentDeferredException ex) { deferred = ex; }
+                // Outside the catch block on purpose: a handler runs on top of
+                // the frames that threw, i.e. on the exhausted stack.
+                ComputeDeferred(deferred);
+            }
+        }
+        finally { _session.Driving = false; }
+    }
+
+    private FormulaResult? EvaluateRoot(string formula)
+    {
+        try
+        {
+            if (_depth == 0) { _visiting.Clear(); _session.InFlight.Clear(); _expandingNames.Clear(); _session.CycleMemo.Clear(); }
             // Accept both qualified (`_xlfn.SEQUENCE`) and bare (`SEQUENCE`)
             // forms. Stored XML uses the qualified form post-R11-2; user code
             // and tests still pass the canonical name.
             return EvaluateFormula(ModernFunctionQualifier.Unqualify(formula));
         }
+        catch (PrecedentDeferredException) { throw; }
         catch (NameResolutionException) { return FormulaResult.Error("#NAME?"); }
         catch { return null; }
+    }
+
+    // Compute a deferred cell, and whatever it defers in turn, with an explicit
+    // work stack: the deepest unresolved precedent is evaluated first, each from
+    // a shallow call stack, and its result recorded in the session before the
+    // cell that needed it is retried. Every pending cell is among the ancestors
+    // of the one on top, so reaching it again is a circular reference, not a
+    // second deferral; the #NUM! branch only guarantees the loop ends.
+    private void ComputeDeferred(PrecedentDeferredException first)
+    {
+        var pending = new Stack<PrecedentDeferredException>();
+        var pendingKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { first.Key };
+        pending.Push(first);
+        _visiting.UnionWith(first.Ancestors);
+        while (pending.Count > 0)
+        {
+            var top = pending.Peek();
+            try
+            {
+                var circularBefore = _session.CircularHits;
+                var result = top.Evaluator.ResolveCellResult(top.CellRef);
+                _session.Deferred[top.Key] = (result, circularBefore != _session.CircularHits);
+                pending.Pop();
+                pendingKeys.Remove(top.Key);
+                _visiting.ExceptWith(top.Ancestors);
+            }
+            catch (PrecedentDeferredException next)
+            {
+                if (pendingKeys.Add(next.Key)) { pending.Push(next); _visiting.UnionWith(next.Ancestors); }
+                else _session.Deferred[next.Key] = (FormulaResult.Error("#NUM!"), false);
+            }
+        }
     }
 
     /// <summary>
@@ -758,6 +879,7 @@ internal partial class FormulaEvaluator
             || !System.Runtime.CompilerServices.RuntimeHelpers.TryEnsureSufficientExecutionStack())
             return FormulaResult.Error("#NUM!");
         _parseDepth++;
+        _session.NestingInFlight++;
         try
         {
         var left = ParseAddSub(t, ref p); if (left == null) return null;
@@ -770,7 +892,7 @@ internal partial class FormulaEvaluator
           left = FormulaResult.Str(left.AsString() + right.AsString()); }
         return left;
         }
-        finally { _parseDepth--; }
+        finally { _parseDepth--; _session.NestingInFlight--; }
     }
 
     private FormulaResult? ParseAddSub(List<Token> t, ref int p)
@@ -1257,6 +1379,7 @@ internal partial class FormulaEvaluator
             _session.CircularHits++;
             return FormulaResult.Number(0);
         }
+        _session.InFlight.Add(qualifiedRef);
         try
         {
             var cell = FindCell(cellRef);
@@ -1279,11 +1402,26 @@ internal partial class FormulaEvaluator
                 // computed under bindings must not leak into other contexts.
                 if (_bindings.Count == 0 && _session.CellMemo.TryGetValue(qualifiedRef, out var memoized))
                     return memoized;
+                if (_bindings.Count == 0 && _session.CycleMemo.TryGetValue(qualifiedRef, out var cycleMemoized))
+                    return cycleMemoized;
                 // Primary: probe the real remaining stack (adapts to formula
                 // complexity, so complex nested formulas are covered too).
                 // Secondary: a high fixed backstop. Over either, surface a
                 // visible #NUM! that propagates up the chain (B[N-1]+A[N] returns
                 // the error) — never a silent 0 or an uncatchable crash.
+                if (_session.Deferred.TryGetValue(qualifiedRef, out var deferred))
+                {
+                    if (deferred.CycleDependent) _session.CircularHits++;
+                    return deferred.Result;
+                }
+                // A long dependency chain is not an error, only too deep for
+                // one call stack: hand this cell to the top-level loop, which
+                // computes it from a shallow stack. Decided on nesting, well
+                // before the stack runs low — throwing needs stack of its own.
+                if (_session.Driving && _session.NestingInFlight >= MaxNestingInFlight)
+                    throw new PrecedentDeferredException(this, cellRef, qualifiedRef, _session.InFlight);
+                // Backstops for evaluations no top-level loop owns, and for a
+                // thread whose stack is smaller than the nesting budget assumes.
                 if (_sameSheetDepth >= MaxSameSheetDepth
                     || !System.Runtime.CompilerServices.RuntimeHelpers.TryEnsureSufficientExecutionStack())
                     return FormulaResult.Error("#NUM!");
@@ -1312,12 +1450,17 @@ internal partial class FormulaEvaluator
                         // evaluation (a 0-seeded cycle result depends on where the
                         // cycle was entered). Lambdas capture evaluator state and
                         // are not safe to replay.
-                        if (_bindings.Count == 0 && !evaluated.IsLambda
-                            && circularBefore == _session.CircularHits)
-                            _session.CellMemo[qualifiedRef] = evaluated;
+                        if (_bindings.Count == 0 && !evaluated.IsLambda)
+                        {
+                            if (circularBefore == _session.CircularHits)
+                                _session.CellMemo[qualifiedRef] = evaluated;
+                            else
+                                _session.CycleMemo[qualifiedRef] = evaluated;
+                        }
                         return evaluated;
                     }
                 }
+                catch (PrecedentDeferredException) { throw; }
                 catch { /* fall through to cached value */ }
                 finally { _sameSheetDepth--; _parseDepth = savedParseDepth; }
             }
@@ -1351,7 +1494,7 @@ internal partial class FormulaEvaluator
 
             return FormulaResult.Blank();
         }
-        finally { _visiting.Remove(qualifiedRef); }
+        finally { _visiting.Remove(qualifiedRef); _session.InFlight.RemoveAt(_session.InFlight.Count - 1); }
     }
 
     /// <summary>
@@ -1368,7 +1511,8 @@ internal partial class FormulaEvaluator
         // Chain depth lives on the session (not the instance) because child
         // evaluators are cached per sheet and reused at whatever depth the
         // current chain happens to be.
-        if (_session.CrossSheetDepth > 20) return FormulaResult.Error("#NUM!"); // depth guard
+        bool overCrossSheetDepth = _session.CrossSheetDepth > 20;
+        if (overCrossSheetDepth && !_session.Driving) return FormulaResult.Error("#NUM!"); // depth guard
 
         var bangIdx = sheetCellRef.IndexOf('!');
         if (bangIdx < 0) return FormulaResult.Number(0);
@@ -1398,6 +1542,22 @@ internal partial class FormulaEvaluator
         {
             eval = new FormulaEvaluator(sheetData, _workbookPart, _session, _depth + 1, sheetName);
             _session.SheetEvaluators[sheetName] = eval;
+        }
+        if (overCrossSheetDepth)
+        {
+            // A long chain across sheets is deferred like a long same-sheet
+            // one: the target is computed from the top and found here on retry.
+            var targetRef = StripDollar(cellRef).ToUpperInvariant();
+            var targetKey = string.IsNullOrEmpty(eval._sheetKey) ? targetRef : $"{eval._sheetKey}!{targetRef}";
+            if (_session.Deferred.TryGetValue(targetKey, out var deferred))
+            {
+                if (deferred.CycleDependent) _session.CircularHits++;
+                return deferred.Result;
+            }
+            if (!_visiting.Contains(targetKey)
+                && eval.FindCell(targetRef) is { } target
+                && !string.IsNullOrEmpty(SharedFormulaResolver.ResolveText(target, sheetData)))
+                throw new PrecedentDeferredException(eval, targetRef, targetKey, _session.InFlight);
         }
         _session.CrossSheetDepth++;
         try { return eval.ResolveCellResult(cellRef); }

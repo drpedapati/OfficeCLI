@@ -271,15 +271,17 @@ internal static partial class ChartHelper
                     if (presetProps == null)
                         throw new ArgumentException(
                             $"Unknown chart preset '{value}'. Available: {string.Join(", ", ChartPresets.PresetNames)}.");
-                    // Recursively apply preset properties
-                    var presetUnsupported = SetChartProperties(chartPart, presetProps);
-                    // Silently skip title.* properties when chart has no title —
-                    // presets include title styling but charts may legitimately have no title
-                    var hasTitle = chart.GetFirstChild<C.Title>() != null;
-                    if (!hasTitle)
-                        presetUnsupported.RemoveAll(k => k.StartsWith("title.", StringComparison.OrdinalIgnoreCase)
-                            || (k.StartsWith("title", StringComparison.OrdinalIgnoreCase) && k.Length > 5));
-                    unsupported.AddRange(presetUnsupported);
+                    // A preset describes how a title looks IF the chart has
+                    // one; it must not fabricate a title nor fail a chart that
+                    // legitimately has none. Drop the title.* styling keys up
+                    // front when no title exists (and the preset sets none),
+                    // since the styling keys reject a missing title.
+                    var hasTitle = chart.GetFirstChild<C.Title>() != null || presetProps.ContainsKey("title");
+                    var effectivePreset = hasTitle ? presetProps : presetProps
+                        .Where(kv => !(kv.Key.StartsWith("title.", StringComparison.OrdinalIgnoreCase)
+                            || (kv.Key.StartsWith("title", StringComparison.OrdinalIgnoreCase) && kv.Key.Length > 5)))
+                        .ToDictionary(kv => kv.Key, kv => kv.Value);
+                    unsupported.AddRange(SetChartProperties(chartPart, effectivePreset));
                     break;
                 }
 
@@ -307,7 +309,14 @@ internal static partial class ChartHelper
                 case "title.lang" or "titlelang":
                 {
                     var ctitle = chart.GetFirstChild<C.Title>();
-                    if (ctitle == null) { unsupported.Add(key); break; }
+                    // Styling needs a title to style. The key itself is
+                    // supported, so this is a precondition failure, not an
+                    // unknown prop — and no empty title is fabricated to carry
+                    // the style (it would render as nothing).
+                    if (ctitle == null)
+                        throw new CliException(
+                            $"'{key}' styles the chart title, but this chart has no title. Pass title=<text> in the same command (title is applied first).")
+                { Code = "invalid_value", Suggestion = "Add --prop title=<text> to the same set command, or set title first." };
                     foreach (var run in ctitle.Descendants<Drawing.Run>())
                     {
                         var rPr = run.RunProperties ?? (run.RunProperties = new Drawing.RunProperties());
@@ -1258,7 +1267,7 @@ internal static partial class ChartHelper
                 {
                     var plotArea2 = chart.GetFirstChild<C.PlotArea>();
                     if (plotArea2 == null) { unsupported.Add(key); break; }
-                    var mSize = ParseHelpers.SafeParseByte(value, "markersize");
+                    var mSize = ParseHelpers.ParseMarkerSize(value, "markersize");
                     foreach (var ser in plotArea2.Descendants<OpenXmlCompositeElement>().Where(e => e.LocalName == "ser"))
                     {
                         if (ser is not (C.LineChartSeries or C.ScatterChartSeries or C.RadarChartSeries))
@@ -2230,10 +2239,17 @@ internal static partial class ChartHelper
                     var plotArea2 = chart.GetFirstChild<C.PlotArea>();
                     if (plotArea2 == null) { unsupported.Add(key); break; }
                     var varyVal = ParseHelpers.IsTruthy(value);
+                    // ECMA-376 declares varyColors on bar/bar3D, line/line3D,
+                    // area/area3D, pie/pie3D/ofPie/doughnut, radar, scatter and
+                    // bubble groups only; stockChart and surface/surface3DChart
+                    // have no such child and the validator rejects it there.
+                    var varyApplied = 0;
                     foreach (var ct in plotArea2.ChildElements
                         .Where(e => e.LocalName.Contains("Chart") || e.LocalName.Contains("chart"))
+                        .Where(e => e.LocalName is not ("stockChart" or "surfaceChart" or "surface3DChart"))
                         .OfType<OpenXmlCompositeElement>())
                     {
+                        varyApplied++;
                         ct.RemoveAllChildren<C.VaryColors>();
                         // ECMA-376: in every chart-type element (CT_BarChart,
                         // CT_LineChart, CT_PieChart, CT_AreaChart, ...) varyColors
@@ -2257,6 +2273,7 @@ internal static partial class ChartHelper
                         if (anchor != null) anchor.InsertAfterSelf(vc);
                         else ct.PrependChild(vc);
                     }
+                    if (varyApplied == 0) unsupported.Add(key);
                     break;
                 }
 
@@ -2331,7 +2348,14 @@ internal static partial class ChartHelper
                     var specs = !value.Equals("none", StringComparison.OrdinalIgnoreCase) && value.Contains(';')
                         ? value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                         : new[] { value };
-                    foreach (var ser in plotArea2.Descendants<OpenXmlCompositeElement>().Where(e => e.LocalName == "ser"))
+                    // CONSISTENCY(pie-only-prop): c:trendline exists on CT_BarSer,
+                    // CT_LineSer, CT_ScatterSer, CT_BubbleSer and CT_AreaSer only;
+                    // pie / doughnut / radar / surface series have no slot for it.
+                    var tlTargets = plotArea2.Descendants<OpenXmlCompositeElement>()
+                        .Where(e => e is C.BarChartSeries || e is C.LineChartSeries || e is C.ScatterChartSeries
+                                    || e is C.BubbleChartSeries || e is C.AreaChartSeries).ToList();
+                    if (tlTargets.Count == 0) { unsupported.Add(key); break; }
+                    foreach (var ser in tlTargets)
                     {
                         ser.RemoveAllChildren<C.Trendline>();
                         if (!value.Equals("none", StringComparison.OrdinalIgnoreCase))
@@ -2351,7 +2375,15 @@ internal static partial class ChartHelper
                     var plotArea2 = chart.GetFirstChild<C.PlotArea>();
                     if (plotArea2 == null) { unsupported.Add(key); break; }
                     var inv = ParseHelpers.IsTruthy(value);
-                    foreach (var ser in plotArea2.Descendants<OpenXmlCompositeElement>().Where(e => e.LocalName == "ser"))
+                    // CONSISTENCY(pie-only-prop): c:invertIfNegative exists only on
+                    // CT_BarSer and CT_BubbleSer. Writing it into a line/pie/area
+                    // series produces a schema-invalid part (validate fails, Excel
+                    // repairs). Target only the series types that carry it and
+                    // report unsupported when none do.
+                    var invTargets = plotArea2.Descendants<OpenXmlCompositeElement>()
+                        .Where(e => e is C.BarChartSeries || e is C.BubbleChartSeries).ToList();
+                    if (invTargets.Count == 0) { unsupported.Add(key); break; }
+                    foreach (var ser in invTargets)
                     {
                         ser.RemoveAllChildren<C.InvertIfNegative>();
                         InsertSeriesChildInOrder(ser, new C.InvertIfNegative { Val = inv });
@@ -2691,7 +2723,14 @@ internal static partial class ChartHelper
                     if (angInt < 0 || angInt > 360)
                         throw new ArgumentException($"Invalid firstSliceAngle '{value}': must be in [0, 360] (degrees).");
                     sliceHost.RemoveAllChildren<C.FirstSliceAngle>();
-                    sliceHost.AppendChild(new C.FirstSliceAngle { Val = (ushort)angInt });
+                    // CT_DoughnutChart orders firstSliceAng BEFORE holeSize (and
+                    // extLst); AppendChild put it after holeSize on a doughnut,
+                    // which validate rejects and Excel repairs on open.
+                    var sliceAnchor = (OpenXmlElement?)sliceHost.GetFirstChild<C.HoleSize>()
+                                      ?? sliceHost.GetFirstChild<C.ExtensionList>();
+                    var fsa = new C.FirstSliceAngle { Val = (ushort)angInt };
+                    if (sliceAnchor != null) sliceHost.InsertBefore(fsa, sliceAnchor);
+                    else sliceHost.AppendChild(fsa);
                     break;
                 }
 
@@ -2710,7 +2749,9 @@ internal static partial class ChartHelper
                     if (holeSizeInt < 1 || holeSizeInt > 90)
                         throw new ArgumentException($"Invalid 'holeSize' value: '{value}'. Must be between 1 and 90 (OOXML ST_HoleSize).");
                     doughnut.RemoveAllChildren<C.HoleSize>();
-                    doughnut.AppendChild(new C.HoleSize { Val = (byte)holeSizeInt });
+                    var hs = new C.HoleSize { Val = (byte)holeSizeInt };
+                    var hsExt = doughnut.GetFirstChild<C.ExtensionList>();
+                    if (hsExt != null) doughnut.InsertBefore(hs, hsExt); else doughnut.AppendChild(hs);
                     break;
                 }
 
@@ -3996,8 +4037,8 @@ internal static partial class ChartHelper
         series.RemoveAllChildren<C.Marker>();
         var marker = new C.Marker();
         marker.AppendChild(new C.Symbol { Val = style });
-        if (parts.Length > 1 && byte.TryParse(parts[1], out var size))
-            marker.AppendChild(new C.Size { Val = size });
+        if (parts.Length > 1 && !string.IsNullOrWhiteSpace(parts[1]))
+            marker.AppendChild(new C.Size { Val = ParseHelpers.ParseMarkerSize(parts[1], "marker size") });
         else if (existingSize != null)
             marker.AppendChild(existingSize);
         if (parts.Length > 2)

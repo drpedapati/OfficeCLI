@@ -339,6 +339,8 @@ static partial class CommandBuilder
                 var firstLine = string.IsNullOrEmpty(stderr)
                     ? ""
                     : stderr.Split('\n', 2)[0].TrimEnd('\r').Trim();
+                // "Unhandled exception: System.Xml.XmlException: <msg>" → "<msg>"
+                firstLine = System.Text.RegularExpressions.Regex.Replace(firstLine, @"^Unhandled exception:\s*[\w.]+Exception:\s*", "");
                 error = string.IsNullOrEmpty(firstLine)
                     ? "Resident process exited."
                     : $"Resident process exited. {firstLine}";
@@ -809,6 +811,14 @@ static partial class CommandBuilder
     internal static SetApplyOutcome ApplySetWithCorrection(
         OfficeCli.Core.IDocumentHandler handler, string path, Dictionary<string, string> props)
     {
+        var hasFind = props.Keys.Any(k => k.Equals("find", StringComparison.OrdinalIgnoreCase));
+        var hasReplace = props.Keys.Any(k => k.Equals("replace", StringComparison.OrdinalIgnoreCase));
+        if (hasReplace && !hasFind)
+            throw new OfficeCli.Core.CliException("'replace' requires 'find': nothing to replace was specified.")
+            { Code = "invalid_input", Suggestion = "Pass --find <text> together with --replace, or set text= to overwrite the whole text." };
+        if ((hasFind || hasReplace) && handler is OfficeCli.Handlers.ExcelHandler)
+            throw new OfficeCli.Core.CliException("find/replace is not supported on xlsx cells (cells hold a single value).")
+            { Code = "invalid_input", Suggestion = "Set the cell with --prop value=<text>, or use a selector such as Sheet1!cell[value=old] with value=new." };
         var raw = handler.Set(path, props);
         string? scope = handler switch
         {
@@ -892,10 +902,18 @@ static partial class CommandBuilder
         Dictionary<string, string>? after)
     {
         if (after == null || applied.Count == 0) return "";
+        // camelCase sibling of the requested key (marker → markerSize /
+        // markerColor, point1.marker → point1.markerSize): the readback form
+        // of a compound spelling such as marker=circle:10:FF0000.
+        static bool CamelSibling(string key, string reqKey) =>
+            key.Length > reqKey.Length
+            && key.StartsWith(reqKey, StringComparison.OrdinalIgnoreCase)
+            && char.IsUpper(key[reqKey.Length]);
         bool DiffAttributable(string diffKey, KeyValuePair<string, string> req) =>
             diffKey.Equals(req.Key, StringComparison.OrdinalIgnoreCase)
             || diffKey.StartsWith(req.Key + ".", StringComparison.OrdinalIgnoreCase)
-            || req.Key.StartsWith(diffKey + ".", StringComparison.OrdinalIgnoreCase);
+            || req.Key.StartsWith(diffKey + ".", StringComparison.OrdinalIgnoreCase)
+            || CamelSibling(diffKey, req.Key);
         // Fallback attribution (post-state, no diff evidence): exact key
         // match, or a dotted expansion whose value equals the SAME request's
         // value — pairing both conditions per request keeps a pre-existing
@@ -903,10 +921,21 @@ static partial class CommandBuilder
         // echo (border=thin + wrap=true must not claim
         // border.diagonalUp=true). A same-request sibling genuinely carrying
         // the requested value can still appear — value-truthful, accepted.
+        // A camelCase sibling qualifies in the fallback only when its value
+        // is one of the request's colon segments (markerSize=10 for
+        // marker=circle:10:FF0000), so a pre-existing textAlign never rides
+        // along with text=a:b.
+        static bool SegmentMatches(string reqValue, string value)
+        {
+            if (!reqValue.Contains(':')) return false;
+            var v = value.Trim().TrimStart('#');
+            return reqValue.Split(':').Any(seg => string.Equals(seg.Trim().TrimStart('#'), v, StringComparison.OrdinalIgnoreCase));
+        }
         bool FallbackAttributable(KeyValuePair<string, string> kv, KeyValuePair<string, string> req) =>
             kv.Key.Equals(req.Key, StringComparison.OrdinalIgnoreCase)
             || (kv.Key.StartsWith(req.Key + ".", StringComparison.OrdinalIgnoreCase)
-                && string.Equals(kv.Value, req.Value, StringComparison.Ordinal));
+                && string.Equals(kv.Value, req.Value, StringComparison.Ordinal))
+            || (CamelSibling(kv.Key, req.Key) && SegmentMatches(req.Value, kv.Value));
         var diff = new List<KeyValuePair<string, string>>();
         if (before != null)
             foreach (var kv in after)
@@ -966,12 +995,51 @@ static partial class CommandBuilder
         if (ContainsNullByte(item.Text))
             throw new CliException($"text contains a NUL byte (\\u0000), which is invalid in OOXML.")
                 { Code = "invalid_input" };
+        if (ContainsNullByte(item.Fields))
+            throw new CliException($"fields contains a NUL byte (\\u0000), which is invalid in OOXML.")
+                { Code = "invalid_input" };
         foreach (var (pk, pv) in props)
         {
             if (ContainsNullByte(pk) || ContainsNullByte(pv))
                 throw new CliException($"prop '{pk}' contains a NUL byte (\\u0000), which is invalid in OOXML.")
                     { Code = "invalid_input" };
         }
+
+        // A read verb consumes no props at all. A caller who wrote an output
+        // option there — {"command":"query","props":{"compact":"true"}} — used
+        // to get the full payload back with no diagnostic whatsoever, which is
+        // the shape of the mistake that costs the most context precisely where
+        // a batch-only caller cannot see it (issue #522). Warn, never fail: the
+        // item's previous behaviour (full output) is what the caller falls back
+        // to, and the batch may already be mid-run.
+        var readVerb = item.Command.ToLowerInvariant();
+        if (readVerb is "get" or "query" or "view" && item.Props is { Count: > 0 } ignoredProps)
+        {
+            var ignoredKeys = string.Join(", ", ignoredProps.Keys.Select(k => $"\"{k}\""));
+            var hint = readVerb switch
+            {
+                "query" => "Put the output options on the item itself: \"compact\": true, \"fields\": \"x,y\".",
+                "view" => "A bounded view (start/end/max-lines/cols/range) is not available inside a batch yet — run `view` as its own command.",
+                _ => "A get item takes \"path\" and \"depth\" only.",
+            };
+            OfficeCli.Core.WarningContext.Add(
+                $"'{item.Command}' ignores props ({ignoredKeys}): a read item takes no props. {hint}",
+                "unsupported_property",
+                hint);
+        }
+
+        // `compact` and `fields` are QUERY options. On any other verb they used
+        // to be rejected as an unknown field — blunt, but it told the caller.
+        // Now that they parse, ignoring them there would be a fresh silent drop
+        // of exactly the kind this change exists to remove, so name them.
+        var misplacedReadOptions = new List<string>();
+        if (item.Compact.HasValue) misplacedReadOptions.Add("\"compact\"");
+        if (item.Fields != null) misplacedReadOptions.Add("\"fields\"");
+        if (misplacedReadOptions.Count > 0 && readVerb != "query")
+            OfficeCli.Core.WarningContext.Add(
+                $"'{item.Command}' does not read {string.Join(" or ", misplacedReadOptions)}: they are query-item options. Ignored.",
+                "unsupported_property",
+                "Put them on the item that reads them: {\"command\":\"query\",\"selector\":\"...\",\"compact\":true}.");
 
         switch (item.Command.ToLowerInvariant())
         {
@@ -1018,6 +1086,16 @@ static partial class CommandBuilder
                     // MatchesTextFilter (not plain Contains) so a batch query
                     // text filter honours r"regex" like the CLI and resident do.
                     results = results.Where(n => n.Text != null && OfficeCli.Core.AttributeFilter.MatchesTextFilter(n.Text, textFilter)).ToList();
+                // --compact: the same renderer the standalone command and the
+                // resident use, so the three cannot drift — the line format is a
+                // stability contract, not a per-surface layout (issue #522).
+                // `fields` only means something alongside compact, exactly as in
+                // `query --compact --fields x,y`; there it is ignored without it.
+                if (item.Compact == true)
+                {
+                    foreach (var w in warnings) Console.Error.WriteLine(w.Message);
+                    return FormatNodesCompact(handler, results, item.Fields);
+                }
                 foreach (var w in warnings) Console.Error.WriteLine(w.Message);
                 return OfficeCli.Core.OutputFormatter.FormatNodes(results, format);
             }
@@ -1929,14 +2007,13 @@ static partial class CommandBuilder
                 return 0;
 
             // Document is protected — block the write
-            var msg = $"Document is protected (mode: {protection}). " +
-                      "Use Query(\"editable\") to find editable fields, or use --force to override protection.";
-            if (json)
-                Console.WriteLine(OutputFormatter.WrapEnvelopeError(msg, new List<OfficeCli.Core.CliWarning>()));
-            else
-                Console.Error.WriteLine($"ERROR: {msg}");
-            return 1;
+            // Same error shape as batch / the resident: a coded CliException.
+            throw new OfficeCli.Core.CliException(
+                $"Document is protected (mode: {protection}). " +
+                "Use Query(\"editable\") to find editable fields, or use --force to override protection.")
+            { Code = "document_protected" };
         }
+        catch (OfficeCli.Core.CliException) { throw; } // the protection verdict itself
         catch
         {
             // If we can't read protection info, allow the write to proceed
